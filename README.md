@@ -68,8 +68,8 @@ main.py
 ## Установка
 
 ```bash
-git clone <repo>
-cd <repo>
+git clone https://github.com/brilevg/octagon_project
+cd octagon_project
 pip install -r requirements.txt
 ```
 
