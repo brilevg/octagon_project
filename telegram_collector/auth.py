@@ -1,10 +1,11 @@
 import logging
+from pathlib import Path
 import hashlib
 logger = logging.getLogger(__name__)
 
 
 class Authorization:
-
+    
     def __init__(self, client, api_id, api_hash, phone_number, password):
         self.client = client
         self.api_id = api_id
@@ -33,7 +34,13 @@ class Authorization:
             if self._tdlib_params_sent:
                 return
             self._tdlib_params_sent = True
+            session = hashlib.md5(self.phone_number.encode("utf-8")).hexdigest()
 
+            database_dir = Path("tdlib") / session
+            files_dir = database_dir / "files"
+
+            database_dir.mkdir(parents=True, exist_ok=True)
+            files_dir.mkdir(parents=True, exist_ok=True)
             self.client.send({
                 "@type": "setTdlibParameters",
 
@@ -41,8 +48,8 @@ class Authorization:
                 # смене PHONE_NUMBER в .env TDLib тихо подхватывает уже
                 # лежащую на диске сессию, и PHONE_NUMBER из .env не
                 # используется вообще 
-                "database_directory": f"tdlib/{hashlib.md5(self.phone_number.encode('utf-8')).hexdigest()}",
-                "files_directory": f"tdlib/{hashlib.md5(self.phone_number.encode('utf-8')).hexdigest()}/files",
+                "database_directory": str(database_dir),
+                "files_directory": str(files_dir),
 
                 "use_test_dc": False,
 
