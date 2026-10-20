@@ -6,7 +6,6 @@ import os
 from core.config import load_config
 from core.logger import setup_logging
 
-
 from database.init_db import build_engine, build_session_factory, create_database
 from database.repository import DatabaseRepository
 
@@ -16,6 +15,9 @@ from telegram_collector.auth import Authorization
 from telegram_collector.collector import TelegramCollector
 
 from telegram_admin.bot import start_admin_bot
+
+from yandex.worker import QualityWorker
+
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -74,6 +76,35 @@ admin_bot = start_admin_bot(
     config.bot.admin_ids,
     session_factory,
 )
+
+# Worker получает собственный репозиторий и отдельную сессию БД.
+quality_worker = None
+
+if os.getenv("YANDEX_API_KEY") and os.getenv("YANDEX_FOLDER_ID"):
+    try:
+        quality_worker = QualityWorker(
+            repository_factory=lambda: DatabaseRepository(session_factory),
+            poll_interval=5,
+            batch_size=5,
+            pipeline_version="v1",
+            max_attempts=5,
+            retry_delay_seconds=60,
+        )
+
+        quality_worker.start()
+        logger.info("LLM quality worker запущен")
+
+    except Exception:
+        quality_worker = None
+        logger.exception(
+            "Не удалось запустить LLM worker. "
+            "Сбор Telegram продолжит работу."
+        )
+else:
+    logger.warning(
+        "LLM worker не запущен: проверь YANDEX_API_KEY "
+        "и YANDEX_FOLDER_ID."
+    )
 
 client.send({
     "@type": "addProxy",
@@ -155,4 +186,6 @@ except KeyboardInterrupt:
     logger.info("Остановка по Ctrl-C")
 
 finally:
+    if quality_worker is not None:
+        quality_worker.stop()
     admin_bot.stop()

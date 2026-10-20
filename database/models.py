@@ -3,11 +3,15 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    DateTime,
+    Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    JSON,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -261,3 +265,194 @@ class Attachment(Base):
     received_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
     message = relationship("Message", back_populates="attachments")
+
+
+class AnalysisJob(Base):
+    """Очередь анализа конкретной версии сообщения."""
+
+    __tablename__ = "analysis_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id"),
+        index=True,
+    )
+
+    message_version: Mapped[int] = mapped_column(Integer)
+    pipeline_version: Mapped[str] = mapped_column(
+        String(50),
+        default="v1",
+    )
+
+    # pending | processing | completed | failed
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default="pending",
+        index=True,
+    )
+
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+    available_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow,
+        index=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow,
+    )
+
+    message = relationship("Message")
+
+    findings = relationship(
+        "QualityFinding",
+        back_populates="job",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "message_version",
+            "pipeline_version",
+            name="uq_analysis_job_message_version",
+        ),
+        Index(
+            "ix_analysis_jobs_queue",
+            "status",
+            "priority",
+            "available_at",
+        ),
+    )
+
+
+class QualityFinding(Base):
+    """Одно замечание, обнаруженное при анализе."""
+
+    __tablename__ = "quality_findings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("analysis_jobs.id"),
+        index=True,
+    )
+
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id"),
+        index=True,
+    )
+
+    category: Mapped[str] = mapped_column(String(50), index=True)
+    severity: Mapped[str] = mapped_column(String(20), index=True)
+
+    confidence: Mapped[float] = mapped_column(Float)
+
+    evidence: Mapped[str] = mapped_column(Text)
+    explanation: Mapped[str] = mapped_column(Text)
+    recommendation: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    model: Mapped[str] = mapped_column(String(100))
+    pipeline_version: Mapped[str] = mapped_column(String(50))
+
+    # pending_review | confirmed | rejected
+    review_status: Mapped[str] = mapped_column(
+        String(30),
+        default="pending_review",
+        index=True,
+    )
+
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow,
+        index=True,
+    )
+
+    job = relationship("AnalysisJob", back_populates="findings")
+    message = relationship("Message")
+
+
+class QualityMetric(Base):
+    """Вычисленная метрика взаимодействия между сообщениями."""
+
+    __tablename__ = "quality_metrics"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    chat_id: Mapped[int] = mapped_column(
+        ForeignKey("chats.id"),
+        index=True,
+    )
+
+    # Сообщение, которое рассматриваем как ответ.
+    source_message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id"),
+    )
+
+    # Сообщение, на которое предположительно ответили.
+    target_message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id"),
+    )
+
+    responder_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=True,
+        index=True,
+    )
+
+    # explicit_reply | next_message_estimate
+    metric_type: Mapped[str] = mapped_column(String(40))
+
+    response_seconds: Mapped[float] = mapped_column(Float)
+
+    pipeline_version: Mapped[str] = mapped_column(
+        String(50),
+        default="v1",
+    )
+
+    computed_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow,
+    )
+
+    source_message = relationship(
+        "Message",
+        foreign_keys=[source_message_id],
+    )
+
+    target_message = relationship(
+        "Message",
+        foreign_keys=[target_message_id],
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_message_id",
+            "target_message_id",
+            "metric_type",
+            "pipeline_version",
+            name="uq_quality_metric_message_pair",
+        ),
+        Index(
+            "ix_quality_metrics_chat_computed",
+            "chat_id",
+            "computed_at",
+        ),
+    )

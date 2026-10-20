@@ -1,6 +1,7 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
+from sqlalchemy import and_, exists, not_, or_
 from sqlalchemy.orm import selectinload
 from .models import (
     Attachment,
@@ -9,6 +10,9 @@ from .models import (
     MessageRevision,
     Reaction,
     User,
+    AnalysisJob,
+    QualityFinding,
+    QualityMetric,
 )
 logger = logging.getLogger(__name__)
 
@@ -1140,3 +1144,314 @@ class DatabaseRepository:
                 ))
 
         self._save_reaction_events(message, desired_items)
+        # ---------- анализ качества сообщений ----------
+
+    
+    def enqueue_revision_jobs(
+        self,
+        limit: int = 500,
+        pipeline_version: str = "v1",
+    ) -> int:
+        """Добавляет в очередь ещё не обработанные ревизии сообщений."""
+        now = datetime.utcnow()
+
+        try:
+            revisions = (
+                self.db.query(MessageRevision)
+                .outerjoin(
+                    AnalysisJob,
+                    and_(
+                        AnalysisJob.message_id == MessageRevision.message_id,
+                        AnalysisJob.message_version == MessageRevision.id,
+                        AnalysisJob.pipeline_version == pipeline_version,
+                    ),
+                )
+                .filter(
+                    AnalysisJob.id.is_(None),
+                    MessageRevision.text.isnot(None),
+                    MessageRevision.text != "",
+                    MessageRevision.revision_type.in_(["created", "edited"]),
+                )
+                .order_by(MessageRevision.id.asc())
+                .limit(limit)
+                .all()
+            )
+
+            for revision in revisions:
+                self.db.add(
+                    AnalysisJob(
+                        message_id=revision.message_id,
+                        message_version=revision.id,
+                        pipeline_version=pipeline_version,
+                        status="pending",
+                        priority=0,
+                        attempts=0,
+                        available_at=now,
+                        created_at=now,
+                    )
+                )
+
+            self.db.commit()
+            return len(revisions)
+
+        except Exception:
+            self.db.rollback()
+            logger.exception("Не удалось добавить ревизии в очередь анализа")
+            raise
+
+
+    def claim_revision_jobs(
+        self,
+        limit: int = 5,
+        pipeline_version: str = "v1",
+    ) -> list[dict]:
+        """Забирает задачи и возвращает данные для worker."""
+        now = datetime.utcnow()
+
+        try:
+            jobs = (
+                self.db.query(AnalysisJob)
+                .filter(
+                    AnalysisJob.status == "pending",
+                    AnalysisJob.pipeline_version == pipeline_version,
+                    AnalysisJob.available_at <= now,
+                )
+                .order_by(
+                    AnalysisJob.priority.desc(),
+                    AnalysisJob.available_at.asc(),
+                    AnalysisJob.id.asc(),
+                )
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+                .all()
+            )
+
+            result = []
+
+            for job in jobs:
+                # В очереди ревизий message_version содержит revision.id.
+                revision = (
+                    self.db.query(MessageRevision)
+                    .filter(
+                        MessageRevision.id == job.message_version,
+                        MessageRevision.message_id == job.message_id,
+                    )
+                    .first()
+                )
+
+                if (
+                    revision is None
+                    or revision.text is None
+                    or not revision.text.strip()
+                    or revision.revision_type not in ("created", "edited")
+                ):
+                    job.status = "failed"
+                    job.last_error = "Ревизия отсутствует или не содержит текста"
+                    job.completed_at = now
+                    continue
+
+                message = (
+                    self.db.query(Message)
+                    .filter(Message.id == revision.message_id)
+                    .first()
+                )
+
+                if message is None:
+                    job.status = "failed"
+                    job.last_error = "Исходное сообщение не найдено"
+                    job.completed_at = now
+                    continue
+
+                job.status = "processing"
+                job.started_at = now
+                job.attempts = (job.attempts or 0) + 1
+
+                result.append({
+                    "job_id": job.id,
+                    "revision_id": revision.id,
+                    "message_id": message.id,
+                    "chat_id": message.chat_id,
+                    "sender_id": message.sender_id,
+                    "text": revision.text,
+                    "revision_type": revision.revision_type,
+                    "revision_date": revision.tg_date,
+                    "pipeline_version": job.pipeline_version,
+                })
+
+            self.db.commit()
+            return result
+
+        except Exception:
+            self.db.rollback()
+            logger.exception("Не удалось забрать задачи анализа ревизий")
+            raise
+
+
+    def save_quality_findings(
+        self,
+        job_id: int,
+        findings: list[dict],
+        model: str,
+        pipeline_version: str = "v1",
+    ) -> None:
+        """Сохраняет замечания и завершает задачу анализа."""
+        try:
+            job = (
+                self.db.query(AnalysisJob)
+                .filter(AnalysisJob.id == job_id)
+                .with_for_update()
+                .first()
+            )
+
+            if job is None:
+                raise ValueError(f"Задача анализа {job_id} не найдена")
+
+            if job.status != "processing":
+                raise ValueError(
+                    f"Нельзя завершить задачу {job_id}: "
+                    f"текущий статус — {job.status}"
+                )
+
+            revision = (
+                self.db.query(MessageRevision)
+                .filter(
+                    MessageRevision.id == job.message_version,
+                    MessageRevision.message_id == job.message_id,
+                )
+                .first()
+            )
+
+            if revision is None:
+                job.status = "superseded"
+                job.completed_at = datetime.utcnow()
+                self.db.commit()
+                return
+
+            now = datetime.utcnow()
+
+            for finding in findings:
+                self.db.add(
+                    QualityFinding(
+                        job_id=job.id,
+                        message_id=job.message_id,
+                        category=finding["category"],
+                        severity=finding["severity"],
+                        confidence=finding.get("confidence", 0.0),
+                        evidence=finding.get("evidence", ""),
+                        explanation=finding.get("explanation", ""),
+                        recommendation=finding.get("recommendation"),
+                        model=model,
+                        pipeline_version=pipeline_version,
+                        review_status="pending_review",
+                        created_at=now,
+                    )
+                )
+
+            job.status = "completed"
+            job.completed_at = now
+            job.last_error = None
+
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "Не удалось сохранить результаты задачи %s",
+                job_id,
+            )
+            raise
+    
+    def fail_analysis_job(
+        self,
+        job_id,
+        error,
+        max_attempts=5,
+        retry_delay_seconds=60,
+    ):
+        """
+        Обрабатывает ошибку задания.
+
+        До max_attempts задание будет повторено с задержкой.
+        После исчерпания попыток получает статус failed.
+        """
+        try:
+            job = (
+                self.db.query(AnalysisJob)
+                .filter(AnalysisJob.id == job_id)
+                .with_for_update()
+                .first()
+            )
+
+            if job is None:
+                return False
+
+            if job.status != "processing":
+                return False
+
+            job.last_error = str(error)[:4000]
+            job.started_at = None
+
+            if job.attempts >= max_attempts:
+                job.status = "failed"
+                job.completed_at = datetime.utcnow()
+            else:
+                job.status = "pending"
+                job.available_at = (
+                    datetime.utcnow()
+                    + timedelta(seconds=retry_delay_seconds)
+                )
+
+            self.db.commit()
+            return True
+
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "Не удалось обработать ошибку задания %s",
+                job_id,
+            )
+            raise
+    
+    def recover_stale_analysis_jobs(
+        self,
+        stale_after_minutes: int = 15,
+        max_attempts: int = 5,
+    ) -> int:
+        """Восстанавливает задачи, оставшиеся processing после сбоя."""
+        try:
+            cutoff = datetime.utcnow() - timedelta(
+                minutes=stale_after_minutes
+            )
+
+            stale_jobs = (
+                self.db.query(AnalysisJob)
+                .filter(
+                    AnalysisJob.status == "processing",
+                    AnalysisJob.started_at < cutoff,
+                )
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+
+            now = datetime.utcnow()
+
+            for job in stale_jobs:
+                job.started_at = None
+                job.last_error = (
+                    "Задача восстановлена после зависания worker"
+                )
+
+                if job.attempts >= max_attempts:
+                    job.status = "failed"
+                    job.completed_at = now
+                else:
+                    job.status = "pending"
+                    job.available_at = now
+                    job.completed_at = None
+
+            self.db.commit()
+            return len(stale_jobs)
+
+        except Exception:
+            self.db.rollback()
+            raise
