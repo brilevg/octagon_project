@@ -1,8 +1,11 @@
 import logging
+import statistics
+from collections import defaultdict
 from datetime import datetime, timedelta
 import traceback
-from sqlalchemy import and_, exists, not_, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import and_, func, exists, not_, or_
+from sqlalchemy.orm import aliased, selectinload
+
 from .models import (
     Attachment,
     Chat,
@@ -15,6 +18,7 @@ from .models import (
     QualityMetric,
 )
 logger = logging.getLogger(__name__)
+METRICS_VERSION = "m1"
 
 def parse_reaction_type(reaction_type):
     """
@@ -400,7 +404,14 @@ class DatabaseRepository:
             return text or "[голосовое сообщение]"
 
         return ""
-
+    
+    @staticmethod
+    def _extract_reply_to(message):
+        reply = message.get("reply_to")
+        if isinstance(reply, dict) and reply.get("@type") == "messageReplyToMessage":
+            return reply.get("message_id") or None
+        return message.get("reply_to_message_id") or None
+    
     def save_message(self, message):
         """
         Создаёт сообщение, если его ещё нет, либо — если оно уже
@@ -457,7 +468,7 @@ class DatabaseRepository:
                 text=text,
                 tg_date=tg_date,
                 tg_edit_date=tg_edit_date,
-                reply_to=message.get("reply_to_message_id"),
+                reply_to=self._extract_reply_to(message),
                 is_outgoing=message["is_outgoing"],
                 version=1
             )
@@ -476,6 +487,10 @@ class DatabaseRepository:
         else:
 
             msg = existing
+
+            reply_to = self._extract_reply_to(message)
+            if reply_to and msg.reply_to is None:
+                msg.reply_to = reply_to
 
             content_changed = (
                 msg.text != text or msg.tg_edit_date != tg_edit_date
@@ -1276,6 +1291,7 @@ class DatabaseRepository:
                     "revision_type": revision.revision_type,
                     "revision_date": revision.tg_date,
                     "pipeline_version": job.pipeline_version,
+                    "context": self._build_analysis_context(message),
                 })
 
             self.db.commit()
@@ -1395,11 +1411,12 @@ class DatabaseRepository:
                 job.status = "failed"
                 job.completed_at = datetime.utcnow()
             else:
-                job.status = "pending"
-                job.available_at = (
-                    datetime.utcnow()
-                    + timedelta(seconds=retry_delay_seconds)
+                delay = min(
+                    retry_delay_seconds * (2 ** max((job.attempts or 1) - 1, 0)),
+                    3600,
                 )
+                job.status = "pending"
+                job.available_at = datetime.utcnow() + timedelta(seconds=delay)
 
             self.db.commit()
             return True
@@ -1455,3 +1472,242 @@ class DatabaseRepository:
         except Exception:
             self.db.rollback()
             raise
+    
+    def _build_analysis_context(self, message):
+        """Контекст для LLM: reply-цель и 3 предыдущих сообщения. Авторы обезличены."""
+        reply_text = None
+        if message.reply_to:
+            target = self.get_message(message.chat_id, message.reply_to)
+            if target is not None and target.text:
+                reply_text = target.text[:500]
+
+        previous = (
+            self.db.query(Message)
+            .filter(
+                Message.chat_id == message.chat_id,
+                Message.id != message.id,
+                Message.tg_date <= message.tg_date,
+                Message.is_deleted.is_(False),
+                Message.text.isnot(None),
+                Message.text != "",
+            )
+            .order_by(Message.tg_date.desc(), Message.id.desc())
+            .limit(3)
+            .all()
+        )
+        return {
+            "reply_to": reply_text,
+            "previous_messages": [
+                {
+                    "from": "same_author"
+                    if p.sender_id is not None and p.sender_id == message.sender_id
+                    else "other",
+                    "text": p.text[:500],
+                }
+                for p in reversed(previous)
+            ],
+        }
+
+    def compute_response_metrics(self, limit=1000, max_estimate_gap_seconds=6 * 3600):
+        """
+        explicit_reply — точное время ответа на reply другого автора.
+        next_message_estimate — ОЦЕНКА для сообщений без reply: предыдущее
+        сообщение чата от другого автора, не старше max_estimate_gap_seconds.
+        Идемпотентно (уже посчитанные пары пропускаются).
+        Возвращает число, которое >= limit, если остались необработанные пары.
+        """
+        try:
+            created = 0
+
+            Target = aliased(Message)
+            explicit = (
+                self.db.query(Message, Target)
+                .join(Target, and_(
+                    Target.chat_id == Message.chat_id,
+                    Target.telegram_message_id == Message.reply_to,
+                ))
+                .outerjoin(QualityMetric, and_(
+                    QualityMetric.source_message_id == Message.id,
+                    QualityMetric.target_message_id == Target.id,
+                    QualityMetric.metric_type == "explicit_reply",
+                    QualityMetric.pipeline_version == METRICS_VERSION,
+                ))
+                .filter(
+                    QualityMetric.id.is_(None),
+                    Message.reply_to.isnot(None),
+                    Message.sender_id.isnot(None),
+                    or_(Target.sender_id.is_(None), Message.sender_id != Target.sender_id),
+                    Message.tg_date >= Target.tg_date,
+                )
+                .order_by(Message.id.asc())
+                .limit(limit)
+                .all()
+            )
+            for source, target in explicit:
+                self.db.add(QualityMetric(
+                    chat_id=source.chat_id,
+                    source_message_id=source.id,
+                    target_message_id=target.id,
+                    responder_user_id=source.sender_id,
+                    metric_type="explicit_reply",
+                    response_seconds=(source.tg_date - target.tg_date).total_seconds(),
+                    pipeline_version=METRICS_VERSION,
+                ))
+                created += 1
+
+            prev_id = func.lag(Message.id).over(
+                partition_by=Message.chat_id,
+                order_by=[Message.tg_date, Message.id],
+            ).label("prev_id")
+            ordered = (
+                self.db.query(Message.id.label("id"), prev_id)
+                .filter(Message.is_deleted.is_(False))
+                .subquery()
+            )
+            Source = aliased(Message)
+            Prev = aliased(Message)
+            gap = func.extract("epoch", Source.tg_date - Prev.tg_date)
+
+            estimates = (
+                self.db.query(Source, Prev, gap)
+                .select_from(ordered)
+                .join(Source, Source.id == ordered.c.id)
+                .join(Prev, Prev.id == ordered.c.prev_id)
+                .outerjoin(QualityMetric, and_(
+                    QualityMetric.source_message_id == Source.id,
+                    QualityMetric.target_message_id == Prev.id,
+                    QualityMetric.metric_type == "next_message_estimate",
+                    QualityMetric.pipeline_version == METRICS_VERSION,
+                ))
+                .filter(
+                    QualityMetric.id.is_(None),
+                    Source.reply_to.is_(None),
+                    Source.sender_id.isnot(None),
+                    or_(Prev.sender_id.is_(None), Source.sender_id != Prev.sender_id),
+                    gap <= max_estimate_gap_seconds,
+                )
+                .order_by(Source.id.asc())
+                .limit(limit)
+                .all()
+            )
+            for source, target, seconds in estimates:
+                self.db.add(QualityMetric(
+                    chat_id=source.chat_id,
+                    source_message_id=source.id,
+                    target_message_id=target.id,
+                    responder_user_id=source.sender_id,
+                    metric_type="next_message_estimate",
+                    response_seconds=float(seconds),
+                    pipeline_version=METRICS_VERSION,
+                ))
+                created += 1
+
+            self.db.commit()
+            return max(len(explicit), len(estimates)) if created else 0
+
+        except Exception:
+            self.db.rollback()
+            logger.exception("Не удалось посчитать метрики скорости ответов")
+            raise
+
+    def build_quality_rows(self, telegram_chat_id, date_from, date_to):
+        """Отчёт по качеству за период — простые dict, без ORM-объектов (как build_export_rows)."""
+        chat = self.get_chat(telegram_chat_id)
+        if chat is None:
+            return None
+
+        finding_pairs = (
+            self.db.query(QualityFinding, Message)
+            .join(Message, Message.id == QualityFinding.message_id)
+            .filter(
+                Message.chat_id == chat.id,
+                Message.tg_date >= date_from,
+                Message.tg_date <= date_to,
+            )
+            .order_by(Message.tg_date.asc(), QualityFinding.id.asc())
+            .all()
+        )
+        metrics = (
+            self.db.query(QualityMetric)
+            .join(Message, Message.id == QualityMetric.source_message_id)
+            .filter(
+                QualityMetric.chat_id == chat.id,
+                QualityMetric.pipeline_version == METRICS_VERSION,
+                Message.tg_date >= date_from,
+                Message.tg_date <= date_to,
+            )
+            .all()
+        )
+        job_status_rows = (
+            self.db.query(AnalysisJob.status, func.count(AnalysisJob.id))
+            .join(Message, Message.id == AnalysisJob.message_id)
+            .filter(
+                Message.chat_id == chat.id,
+                Message.tg_date >= date_from,
+                Message.tg_date <= date_to,
+            )
+            .group_by(AnalysisJob.status)
+            .all()
+        )
+
+        user_ids, chat_ids = set(), set()
+        for _, msg in finding_pairs:
+            if msg.sender_id:
+                user_ids.add(msg.sender_id)
+            if msg.sender_chat_id:
+                chat_ids.add(msg.sender_chat_id)
+        for m in metrics:
+            if m.responder_user_id:
+                user_ids.add(m.responder_user_id)
+        user_names, chat_names = self._build_sender_name_maps(user_ids, chat_ids)
+
+        def sender_label(sender_id, sender_chat_id):
+            if sender_id:
+                return user_names.get(sender_id, f"user#{sender_id}")
+            if sender_chat_id:
+                return chat_names.get(sender_chat_id, f"chat#{sender_chat_id}")
+            return ""
+
+        findings_rows = [
+            {
+                "finding_id": f.id,
+                "message_tg_id": msg.telegram_message_id,
+                "tg_date": msg.tg_date,
+                "sender": sender_label(msg.sender_id, msg.sender_chat_id),
+                "message_text": msg.text,
+                "category": f.category,
+                "severity": f.severity,
+                "confidence": f.confidence,
+                "evidence": f.evidence,
+                "explanation": f.explanation,
+                "recommendation": f.recommendation,
+                "review_status": f.review_status,
+            }
+            for f, msg in finding_pairs
+        ]
+
+        grouped = defaultdict(list)
+        for m in metrics:
+            grouped[(m.responder_user_id, m.metric_type)].append(m.response_seconds)
+
+        metrics_summary = []
+        for (user_id, metric_type), values in grouped.items():
+            values.sort()
+            metrics_summary.append({
+                "sender": sender_label(user_id, None),
+                "metric_type": metric_type,
+                "count": len(values),
+                "median_seconds": statistics.median(values),
+                "mean_seconds": statistics.fmean(values),
+                "p90_seconds": values[int(0.9 * (len(values) - 1))],
+            })
+        metrics_summary.sort(key=lambda r: (r["sender"], r["metric_type"]))
+
+        return {
+            "chat_title": chat.title or str(chat.telegram_chat_id),
+            "findings": findings_rows,
+            "metrics_summary": metrics_summary,
+            "job_statuses": {s: c for s, c in job_status_rows},
+        }
+
+

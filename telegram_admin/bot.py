@@ -28,7 +28,9 @@ async def _post_init(application: Application) -> None:
         ("start", "Информация о боте и доступе"),
         ("chats", "Список отслеживаемых чатов"),
         ("export", "Выгрузить переписку за период"),
+        ("quality", "Отчёт о проблемах качества"),
         ("cancel", "Отменить текущую операцию"),
+        
     ])
 
 from telegram.error import NetworkError, TimedOut
@@ -106,7 +108,7 @@ def build_application(bot_token: str, admin_ids, session_factory) -> Application
 
     application.add_handler(
         ConversationHandler(
-            entry_points=[CommandHandler("export", commands.export_start)],
+            entry_points=[CommandHandler("export", commands.export_start),CommandHandler("quality", commands.quality_start)],
             states={
                 commands.CHOOSING_PERIOD: [
                     CallbackQueryHandler(commands.choose_chat, pattern=r"^chat:"),
