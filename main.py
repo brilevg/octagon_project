@@ -106,6 +106,9 @@ else:
         "и YANDEX_FOLDER_ID."
     )
 
+# proxy_sent = False
+# if not proxy_sent and auth._tdlib_params_sent:
+    # proxy_sent = True
 client.send({
     "@type": "addProxy",
     "proxy": {
@@ -122,7 +125,7 @@ client.send({
 
 client.send({
     "@type": "setLogVerbosityLevel",
-    "new_verbosity_level": 1
+    "new_verbosity_level": 3
 })
 client.execute({
     "@type": "setLogStream",

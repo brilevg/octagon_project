@@ -13,6 +13,28 @@ PERIOD_LABELS = {
     PERIOD_CUSTOM: "Свой период",
 }
 
+# callback_data: "category:<код>"
+CATEGORY_LABELS = {
+    "all": "Все категории",
+    "toxicity": "Токсичность",
+    "politeness": "Вежливость",
+    "correctness": "Корректность",
+    "communication_style": "Стиль общения",
+    "clarity": "Ясность",
+    "corporate_policy": "Корп. стандарты",
+    "privacy_risk": "Риск утечки данных",
+    "model_refusal": "Отказ модели (ручная проверка)",
+    "speed": "Только скорость ответов",
+}
+
+
+def categories_keyboard():
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"category:{code}")]
+        for code, label in CATEGORY_LABELS.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
+
 
 def chats_keyboard(chats):
     """

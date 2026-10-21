@@ -1610,13 +1610,14 @@ class DatabaseRepository:
             logger.exception("Не удалось посчитать метрики скорости ответов")
             raise
 
-    def build_quality_rows(self, telegram_chat_id, date_from, date_to):
+    def build_quality_rows(self, telegram_chat_id, date_from, date_to, category=None):
         """Отчёт по качеству за период — простые dict, без ORM-объектов (как build_export_rows)."""
         chat = self.get_chat(telegram_chat_id)
         if chat is None:
             return None
 
-        finding_pairs = (
+        
+        finding_query = (
             self.db.query(QualityFinding, Message)
             .join(Message, Message.id == QualityFinding.message_id)
             .filter(
@@ -1624,8 +1625,13 @@ class DatabaseRepository:
                 Message.tg_date >= date_from,
                 Message.tg_date <= date_to,
             )
-            .order_by(Message.tg_date.asc(), QualityFinding.id.asc())
-            .all()
+        )
+        if category and category != "speed":
+            finding_query = finding_query.filter(QualityFinding.category == category)
+
+        finding_pairs = (
+            [] if category == "speed"
+            else finding_query.order_by(Message.tg_date.asc(), QualityFinding.id.asc()).all()
         )
         metrics = (
             self.db.query(QualityMetric)
@@ -1638,6 +1644,9 @@ class DatabaseRepository:
             )
             .all()
         )
+        
+        if category and category != "speed":
+            metrics = []
         job_status_rows = (
             self.db.query(AnalysisJob.status, func.count(AnalysisJob.id))
             .join(Message, Message.id == AnalysisJob.message_id)

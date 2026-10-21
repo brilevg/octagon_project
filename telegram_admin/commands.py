@@ -17,7 +17,7 @@ from . import keyboards
 
 logger = logging.getLogger(__name__)
 
-CHOOSING_PERIOD, AWAITING_CUSTOM_RANGE = range(2)
+CHOOSING_PERIOD, AWAITING_CUSTOM_RANGE, CHOOSING_CATEGORY = range(3)
 
 COMMANDS_TEXT = (
     "Доступные команды:\n"
@@ -181,6 +181,14 @@ async def choose_period(update: Update, context: CallbackContext) -> int:
     else:  # PERIOD_MONTH
         date_from = now - timedelta(days=30)
 
+    if context.user_data.get("export_kind") == "quality":
+        context.user_data["export_range"] = (date_from, now)
+        context.user_data["export_period_label"] = _filename_range_label(date_from, now)
+        await query.edit_message_text(
+            "Выберите категорию:", reply_markup=keyboards.categories_keyboard()
+        )
+        return CHOOSING_CATEGORY
+    
     await query.edit_message_text("Готовлю выгрузку…")
     await _send_export(update, context, date_from, now, _filename_range_label(date_from, now))
     return ConversationHandler.END
@@ -205,6 +213,17 @@ async def custom_range_received(update: Update, context: CallbackContext) -> int
         )
         return AWAITING_CUSTOM_RANGE
 
+    
+    if context.user_data.get("export_kind") == "quality":
+        context.user_data["export_range"] = (date_from, date_to)
+        context.user_data["export_period_label"] = _filename_range_label(
+            date_from, date_to - timedelta(seconds=1)
+        )
+        await update.message.reply_text(
+            "Выберите категорию:", reply_markup=keyboards.categories_keyboard()
+        )
+        return CHOOSING_CATEGORY
+    
     await update.message.reply_text("Готовлю выгрузку…")
     await _send_export(
         update, context, date_from, date_to,
@@ -460,9 +479,9 @@ def _build_quality_workbook(data: dict) -> BytesIO:
     return buf
 
 
-async def _send_quality_report(update, context, date_from, date_to, period_label) -> None:
+async def _send_quality_report(update, context, date_from, date_to, period_label, category=None) -> None:
     telegram_chat_id = context.user_data.get("export_chat_id")
-    data = await _run_db(context, "build_quality_rows", telegram_chat_id, date_from, date_to)
+    data = await _run_db(context, "build_quality_rows", telegram_chat_id, date_from, date_to, category)
     chat_id = update.effective_chat.id
 
     if data is None:
@@ -478,11 +497,41 @@ async def _send_quality_report(update, context, date_from, date_to, period_label
         return
 
     workbook = await asyncio.to_thread(_build_quality_workbook, data)
-    filename = f"quality_{_safe_filename_part(data['chat_title'])}_{_safe_filename_part(period_label)}.xlsx"
-
+    filename = (
+        f"quality_{_safe_filename_part(data['chat_title'])}_"
+        f"{_safe_filename_part(period_label)}"
+        f"{'_' + category if category else ''}.xlsx"
+    )
+    
     await context.bot.send_document(
         chat_id,
         document=workbook,
         filename=filename,
         caption=f"Замечаний: {len(data['findings'])}. Статус анализа — {queue_line}",
     )
+
+@restricted
+async def choose_category(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        category = query.data.split(":", 1)[1]
+    except IndexError:
+        logger.exception("ADMIN BOT: некорректный callback_data в choose_category: %r", query.data)
+        await query.edit_message_text("Ошибка выбора категории. Начните заново: /quality")
+        return ConversationHandler.END
+
+    date_range = context.user_data.get("export_range")
+    if not date_range:
+        await query.edit_message_text("Сессия устарела. Начните заново: /quality")
+        return ConversationHandler.END
+
+    date_from, date_to = date_range
+    await query.edit_message_text("Готовлю отчёт…")
+    await _send_quality_report(
+        update, context, date_from, date_to,
+        context.user_data.get("export_period_label", "period"),
+        None if category == "all" else category,
+    )
+    return ConversationHandler.END

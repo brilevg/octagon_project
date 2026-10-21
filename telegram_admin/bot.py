@@ -110,6 +110,9 @@ def build_application(bot_token: str, admin_ids, session_factory) -> Application
         ConversationHandler(
             entry_points=[CommandHandler("export", commands.export_start),CommandHandler("quality", commands.quality_start)],
             states={
+                commands.CHOOSING_CATEGORY: [
+                    CallbackQueryHandler(commands.choose_category, pattern=r"^category:"),
+                ],
                 commands.CHOOSING_PERIOD: [
                     CallbackQueryHandler(commands.choose_chat, pattern=r"^chat:"),
                     CallbackQueryHandler(commands.choose_period, pattern=r"^period:"),
